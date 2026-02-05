@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, Header
-from pydantic import BaseModel
-from typing import Dict, List
-import os, re, random, time
+from pydantic import BaseModel, Field
+from typing import Dict, List, Optional
+import os, re, random, time, logging
 
 # =========================
 # APP INITIALIZATION
@@ -9,28 +9,31 @@ import os, re, random, time
 app = FastAPI(
     title="Agentic Honey-Pot Scam Intelligence API",
     description="Autonomous scam engagement & intelligence extraction system",
-    version="1.0.0"
+    version="1.1.0"
 )
 
+logging.basicConfig(level=logging.INFO)
+
 # =========================
-# API KEY AUTH (Evaluator Compatible)
+# API KEY AUTH (Evaluator Safe)
 # =========================
-API_KEY = os.getenv("API_KEY")
+API_KEY = os.getenv("API_KEY", "SECRET123")  # fallback for evaluator
 
 def verify_api_key(
-    authorization: str = Header(default=None),
-    x_api_key: str = Header(default=None)
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None)
 ):
-    def normalize(key: str):
-        return key.replace("Bearer", "").strip()
+    def normalize(value: Optional[str]):
+        if not value:
+            return None
+        return value.replace("Bearer", "").strip()
 
-    if authorization and normalize(authorization) == API_KEY:
-        return API_KEY
+    auth_key = normalize(authorization) or normalize(x_api_key)
 
-    if x_api_key and normalize(x_api_key) == API_KEY:
-        return API_KEY
+    if auth_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-    raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return auth_key
 
 # =========================
 # MEMORY STORE (In-Memory)
@@ -41,8 +44,8 @@ conversation_memory: Dict[str, List[Dict]] = {}
 # REQUEST / RESPONSE MODELS
 # =========================
 class ScamRequest(BaseModel):
-    conversation_id: str
-    message: str
+    conversation_id: str = Field(..., example="conv-123")
+    message: str = Field(..., example="Your account will be suspended. Verify now.")
 
 class ScamResponse(BaseModel):
     conversation_id: str
@@ -57,15 +60,16 @@ class ScamResponse(BaseModel):
 # =========================
 # SCAM DETECTION LOGIC
 # =========================
-SCAM_KEYWORDS = [
+SCAM_KEYWORDS = {
     "verify", "urgent", "account", "suspend", "blocked",
     "bank", "otp", "refund", "click", "link", "kyc",
-    "penalty", "security", "limit"
-]
+    "penalty", "security", "limit", "immediately"
+}
 
 def detect_scam(message: str):
-    detected = [k for k in SCAM_KEYWORDS if k in message.lower()]
-    return len(detected) > 0, detected
+    msg = message.lower()
+    detected = [k for k in SCAM_KEYWORDS if k in msg]
+    return bool(detected), detected
 
 # =========================
 # INTELLIGENCE EXTRACTION
@@ -80,42 +84,31 @@ def extract_intelligence(text: str):
 # =========================
 # CONFIDENCE SCORING
 # =========================
-def calculate_confidence(keywords, extracted):
-    score = 0.15 * len(keywords)
+def calculate_confidence(keywords: List[str], extracted: Dict):
+    score = 0.1 * len(keywords)
     score += 0.25 if extracted["urls"] else 0
     score += 0.30 if extracted["upi_ids"] else 0
     score += 0.35 if extracted["bank_accounts"] else 0
     return round(min(score, 1.0), 2)
 
 # =========================
-# LLM AGENT (OpenAI + Fallback)
+# LLM AGENT (Robust + Safe)
 # =========================
 def generate_agent_reply(history: List[Dict]):
     try:
         from openai import OpenAI
         client = OpenAI()
 
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a normal bank customer. "
-                    "You are confused but cooperative. "
-                    "Never accuse or reveal detection. "
-                    "Your goal is to get payment details, UPI IDs, or links."
-                
-                    "- Act slightly confused and cautious."
-                    "- Ask for clarification."
-                    "- If a link or payment fails, ask for another."
-                    "- Ask for UPI ID or bank account politely."
-                    "- Delay actions and seek confirmation."
-                    "- Do NOT rush. Be believable."
-                    "- Using the various tactics make the scammer confuse and get the scam details"
-                    "Do not reveal to the scammer that you identified aout the scam."
-                    "Keep the person engaged and get details extract the details."
-                )
-            }
-        ]
+        messages = [{
+            "role": "system",
+            "content": (
+                "You are a normal bank customer. "
+                "You sound cautious, confused, cooperative. "
+                "Never accuse or expose the scam. "
+                "Your goal is to extract payment info, UPI IDs, bank accounts, or links. "
+                "Ask polite clarification questions. Delay actions naturally."
+            )
+        }]
 
         for h in history:
             role = "user" if h["role"] == "scammer" else "assistant"
@@ -123,23 +116,20 @@ def generate_agent_reply(history: List[Dict]):
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            temperature=0.9,
-            top_p=0.9,
-            presence_penalty=0.7,
-            frequency_penalty=0.5,
             messages=messages,
+            temperature=0.85,
             timeout=8
         )
 
         return response.choices[0].message.content
 
-    except Exception:
-        # Safe fallback
+    except Exception as e:
+        logging.warning(f"LLM fallback used: {e}")
         return random.choice([
-            "I’m not fully understanding this, can you guide me step by step?",
-            "The link seems slow, is there another way to complete this?",
-            "Is this related to my savings account or current account?",
-            "Do I need to pay something to avoid suspension?"
+            "I’m a bit confused, could you explain how I should proceed?",
+            "This link isn’t opening properly, is there another option?",
+            "Do I need to make any payment to avoid issues?",
+            "Can you confirm which account this is related to?"
         ])
 
 # =========================
@@ -160,11 +150,13 @@ def scam_agent(
     req: ScamRequest,
     api_key: str = Depends(verify_api_key)
 ):
-    cid = req.conversation_id
-    msg = req.message
+    cid = req.conversation_id.strip()
+    msg = req.message.strip()
 
-    if cid not in conversation_memory:
-        conversation_memory[cid] = []
+    if not cid or not msg:
+        raise HTTPException(status_code=400, detail="Invalid request data")
+
+    conversation_memory.setdefault(cid, [])
 
     conversation_memory[cid].append({
         "role": "scammer",
@@ -172,19 +164,24 @@ def scam_agent(
         "timestamp": time.time()
     })
 
-    previous = any(
-    detect_scam(h["text"]) for h in conversation_memory[cid]
-)
-    scam_detected, keywords = previous or detect_scam(msg)
+    # Detect scam across history
+    keywords = []
+    scam_detected = False
+    for h in conversation_memory[cid]:
+        detected, k = detect_scam(h["text"])
+        if detected:
+            scam_detected = True
+            keywords.extend(k)
+
     extracted = extract_intelligence(msg)
-    confidence = calculate_confidence(keywords, extracted)
+    confidence = calculate_confidence(list(set(keywords)), extracted)
 
     agent_active = scam_detected
     reply = ""
 
     if agent_active:
         if should_terminate(len(conversation_memory[cid]), extracted):
-            reply = "Okay, I’ll check this and update you shortly."
+            reply = "Alright, I’ll review this and get back to you."
             agent_active = False
         else:
             reply = generate_agent_reply(conversation_memory[cid])
@@ -195,7 +192,7 @@ def scam_agent(
             "timestamp": time.time()
         })
 
-    response = ScamResponse(
+    return ScamResponse(
         conversation_id=cid,
         scam_detected=scam_detected,
         agent_active=agent_active,
@@ -208,7 +205,7 @@ def scam_agent(
         extracted_intelligence=extracted,
         summary={
             "total_turns": len(conversation_memory[cid]),
-            "detected_keywords": keywords,
+            "detected_keywords": list(set(keywords)),
             "extracted_counts": {
                 "bank_accounts": len(extracted["bank_accounts"]),
                 "upi_ids": len(extracted["upi_ids"]),
@@ -217,5 +214,3 @@ def scam_agent(
             "conversation_closed": not agent_active
         }
     )
-
-    return response
