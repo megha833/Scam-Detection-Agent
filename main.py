@@ -163,7 +163,10 @@ def scam_agent(req: ScamRequest, api_key: str = Depends(verify_api_key)):
 
     conversation_memory[cid].append({"role": "scammer", "text": msg})
 
-    scam_detected = detect_scam(msg)
+    previous = any(
+    detect_scam(h["text"]) for h in conversation_memory[cid])
+    scam_detected = previous or detect_scam(msg)
+
     extracted = extract_intelligence(msg)
     confidence = calculate_confidence(msg, extracted)
 
