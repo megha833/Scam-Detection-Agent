@@ -184,6 +184,11 @@ def scam_agent(
     req: Optional[ScamRequest] = Body(default=None),
     auth: bool = Depends(verify_api_key)
 ):
+     if req is None:
+        req = ScamRequest(
+            conversation_id="evaluator_default",
+            message="health_check"
+        )
 
     cid = req.conversation_id
     msg = req.message.strip() if req.message else ""
